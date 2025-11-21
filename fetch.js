@@ -14,7 +14,7 @@ const OUTPUT_ROOT = path.join(__dirname, "upazila_maps");
 const DELAY_MS = 300;
 
 // helper: sleep
-const sleep = ms => new Promise(res => setTimeout(res, ms));
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 async function fetchHtml(url) {
   const res = await axios.get(url, {
@@ -24,46 +24,75 @@ async function fetchHtml(url) {
   return res.data;
 }
 
+// Normalize any href into a path *relative* to /UploadedDocument/Map/
+function normalizeHref(href) {
+  if (!href) return null;
+
+  // Drop query / hash if any
+  let clean = href.split("#")[0].split("?")[0].trim();
+  if (!clean) return null;
+
+  // If absolute URL, extract pathname
+  if (clean.startsWith("http://") || clean.startsWith("https://")) {
+    try {
+      const u = new URL(clean);
+      clean = u.pathname;
+    } catch {
+      return null;
+    }
+  }
+
+  // Remove leading slashes
+  clean = clean.replace(/^\/+/, "");
+
+  // Strip UploadedDocument/Map/ prefix (case insensitive)
+  const prefix = "UploadedDocument/Map/";
+  if (clean.toLowerCase().startsWith(prefix.toLowerCase())) {
+    clean = clean.slice(prefix.length);
+  }
+
+  // Now clean is something like "BARISAL/" or "BARISAL/barisal/file.jpg"
+  return clean;
+}
+
 function parseDirectoryLinks(html) {
-  // Directory listing is standard: bunch of <a href="...">name</a>
   const $ = cheerio.load(html);
-  const links = [];
-
-  $("a").each((_, el) => {
-    const href = $(el).attr("href");
-    const text = $(el).text().trim();
-
-    if (!href) return;
-    // Skip parent directory link
-    if (/parent directory/i.test(text)) return;
-
-    links.push({ href, text });
-  });
-
-  // Split into subdirs & files
   const subdirs = [];
   const files = [];
 
-  for (const link of links) {
-    // Most IIS-style listings have folders as "NAME/" and files as "file.ext"
-    if (link.href.endsWith("/")) {
-      subdirs.push(link.href);
+  $("a").each((_, el) => {
+    const text = $(el).text().trim();
+    let href = $(el).attr("href");
+    if (!href) return;
+
+    // Skip "To Parent Directory"
+    if (/parent directory/i.test(text)) return;
+
+    const rel = normalizeHref(href);
+    if (!rel) return;
+
+    // Ignore if somehow points outside the Map tree
+    if (rel.length === 0) return;
+
+    if (rel.endsWith("/")) {
+      subdirs.push(rel);
     } else {
-      files.push(link.href);
+      files.push(rel);
     }
-  }
+  });
 
   return { subdirs, files };
 }
 
 async function downloadFile(relativePath) {
+  // relativePath is like "DHAKA/dhaka/abhaynagar/abhaynagar_road.jpg"
   const url = ROOT_URL + relativePath;
   const localPath = path.join(OUTPUT_ROOT, relativePath);
 
-  // Only upazila-level content: division/district/upazila/file -> 4 segments
   const segments = relativePath.split("/").filter(Boolean);
+
+  // Only upazila-level files: division/district/upazila/file => 4 segments
   if (segments.length < 4) {
-    // This will skip division-level & district-level maps if you only want upazilas
     return;
   }
 
@@ -72,10 +101,8 @@ async function downloadFile(relativePath) {
     return;
   }
 
-  // Make sure folder exists
   fs.mkdirSync(path.dirname(localPath), { recursive: true });
 
-  // Skip if already downloaded
   if (fs.existsSync(localPath)) {
     console.log("Exists, skipping:", relativePath);
     return;
@@ -113,8 +140,12 @@ async function crawl(relativePath = "") {
   const { subdirs, files } = parseDirectoryLinks(html);
 
   // Download files in this directory
-  for (const fileHref of files) {
-    const fullRelPath = path.posix.join(relativePath, fileHref);
+  for (const fileRel of files) {
+    // If we're inside some folder, join; otherwise use fileRel directly
+    const fullRelPath = relativePath
+      ? path.posix.join(relativePath, fileRel)
+      : fileRel;
+
     try {
       await downloadFile(fullRelPath);
     } catch (err) {
@@ -123,8 +154,11 @@ async function crawl(relativePath = "") {
   }
 
   // Recurse into subdirectories
-  for (const dirHref of subdirs) {
-    const nextRelPath = path.posix.join(relativePath, dirHref);
+  for (const dirRel of subdirs) {
+    const nextRelPath = relativePath
+      ? path.posix.join(relativePath, dirRel)
+      : dirRel;
+
     await crawl(nextRelPath);
   }
 }
