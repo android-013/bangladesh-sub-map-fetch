@@ -18,9 +18,9 @@ const ROAD_DIR = path.join(OUTPUT_ROOT, "road");
 function slugify(str) {
   return String(str)
     .toLowerCase()
-    .replace(/['’`]/g, "")           // drop quotes
-    .replace(/[^a-z0-9]+/gi, "_")    // non alnum -> _
-    .replace(/^_+|_+$/g, "");        // trim _
+    .replace(/['’`]/g, "")
+    .replace(/[^a-z0-9]+/gi, "_")
+    .replace(/^_+|_+$/g, "");
 }
 
 async function ensureDirs() {
@@ -33,9 +33,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function downloadWithPage(browser, url, destPath) {
-  if (!url) return;
-
+async function downloadImage(browser, url, destPath) {
   const page = await browser.newPage();
   try {
     const res = await page.goto(url, {
@@ -44,14 +42,14 @@ async function downloadWithPage(browser, url, destPath) {
     });
 
     if (!res) {
-      console.warn("No response for", url);
+      console.warn("    No response for", url);
       await page.close();
       return;
     }
 
     const status = res.status();
     if (status < 200 || status >= 300) {
-      console.warn(`Non-200 for ${url}: ${status}`);
+      console.warn(`    Non-200 for ${url}: ${status}`);
       await page.close();
       return;
     }
@@ -81,7 +79,7 @@ async function downloadWithPage(browser, url, destPath) {
   const page = await browser.newPage();
   await page.goto(BASE_URL, { waitUntil: "networkidle2", timeout: 120000 });
 
-  // Get all districts (value + text), skip "Select (-1)" and value "0"
+  // Get all districts, skip "Select"
   const districts = await page.evaluate(() => {
     const select = document.querySelector("#ctl00_ContentPlaceHolder1_ddlDistrict");
     if (!select) return [];
@@ -89,7 +87,7 @@ async function downloadWithPage(browser, url, destPath) {
       .filter(opt => {
         const val = (opt.value || "").trim();
         if (!val) return false;
-        if (val === "0" || val === "-1") return false; // skip 'Select'
+        if (val === "0" || val === "-1") return false;
         return true;
       })
       .map(opt => ({
@@ -112,19 +110,17 @@ async function downloadWithPage(browser, url, destPath) {
 
     // Select district
     await page.select("#ctl00_ContentPlaceHolder1_ddlDistrict", district.value);
+    await sleep(2000); // allow UpdatePanel to reload
 
-    // Wait for Upazila dropdown to refresh (ASP.NET postback)
-    await sleep(2000);
-
-    // Get upazila list for this district
+    // Get upazilas for this district
     const upazilas = await page.evaluate(() => {
-      const select = document.querySelector('select[name="ctl00$ContentPlaceHolder1$ddlUpazilla"]');
+      const select = document.querySelector("#ctl00_ContentPlaceHolder1_ddlUpazilla");
       if (!select) return [];
       return Array.from(select.options)
         .filter(opt => {
           const val = (opt.value || "").trim();
           if (!val) return false;
-          if (val === "0" || val === "-1") return false; // skip 'Select'
+          if (val === "0" || val === "-1") return false; // "Select"
           return true;
         })
         .map(opt => ({
@@ -144,63 +140,86 @@ async function downloadWithPage(browser, url, destPath) {
       const upSlug = slugify(up.text);
       console.log(`  -> Upazila: ${up.text} (${up.value})`);
 
-      // Select upazila (triggers __doPostBack on change)
-      await page.select('select[name="ctl00$ContentPlaceHolder1$ddlUpazilla"]', up.value);
+      // Select upazila
+      await page.select("#ctl00_ContentPlaceHolder1_ddlUpazilla", up.value);
+      await sleep(2500); // wait for map info to load
 
-      // Give the postback some time
-      await sleep(2500);
+      // Scrape all UploadedDocument JPG paths that contain this upazila name
+      const { allPaths, upazilaPaths, roadPaths } = await page.evaluate(upSlug => {
+        const html = document.documentElement.innerHTML;
+        const regex = /\/UploadedDocument\/[^"']+?\.jpg/gi;
+        const allSet = new Set();
+        let m;
+        while ((m = regex.exec(html)) !== null) {
+          allSet.add(m[0]);
+        }
 
-      // Read the two JPEG download URLs
-      const urls = await page.evaluate(() => {
-        function safeHref(id) {
-          const a = document.getElementById(id);
-          if (!a) return null;
-          const rawHref = a.getAttribute("href");
-          if (!rawHref) return null;
-          const lower = rawHref.toLowerCase();
-          if (lower.startsWith("javascript")) return null;
-          return rawHref;
+        const all = Array.from(allSet);
+
+        const lowerSlug = upSlug.toLowerCase();
+        const filtered = all.filter(p =>
+          p.toLowerCase().includes(lowerSlug)
+        );
+
+        const upazila = [];
+        const road = [];
+
+        for (const p of filtered) {
+          const lower = p.toLowerCase();
+          if (lower.includes("road")) {
+            road.push(p);
+          } else {
+            upazila.push(p);
+          }
         }
 
         return {
-          upazilaUrl: safeHref("ctl00_ContentPlaceHolder1_lnkImg"),
-          roadUrl: safeHref("ctl00_ContentPlaceHolder1_lnkImgRoad")
+          allPaths: filtered,
+          upazilaPaths: upazila,
+          roadPaths: road
         };
-      });
+      }, upSlug);
 
-      const upazilaUrl = urls.upazilaUrl
-        ? new URL(urls.upazilaUrl, BASE_URL).toString()
-        : null;
-      const roadUrl = urls.roadUrl
-        ? new URL(urls.roadUrl, BASE_URL).toString()
-        : null;
+      if (!allPaths.length) {
+        console.warn("    No UploadedDocument JPG paths found for", up.text);
+        continue;
+      }
 
-      // Build filenames
-      if (upazilaUrl) {
-        const upFile = path.join(
+      // If classification fails, fall back to treating all as upazila maps
+      let finalUpazila = upazilaPaths;
+      let finalRoad = roadPaths;
+
+      if (!finalUpazila.length && !finalRoad.length && allPaths.length) {
+        finalUpazila = allPaths;
+      }
+
+      // Download upazila maps
+      let idx = 1;
+      for (const rel of finalUpazila) {
+        const url = new URL(rel, BASE_URL).toString();
+        const dest = path.join(
           UPAZILA_DIR,
-          `${districtSlug}__${upSlug}_upazila.jpg`
+          `${districtSlug}__${upSlug}_upazila_${idx}.jpg`
         );
-        await downloadWithPage(browser, upazilaUrl, upFile);
-      } else {
-        console.warn("    No upazila JPEG URL for", up.text);
+        await downloadImage(browser, url, dest);
+        idx++;
       }
 
-      if (roadUrl) {
-        const roadFile = path.join(
+      // Download road maps
+      idx = 1;
+      for (const rel of finalRoad) {
+        const url = new URL(rel, BASE_URL).toString();
+        const dest = path.join(
           ROAD_DIR,
-          `${districtSlug}__${upSlug}_road.jpg`
+          `${districtSlug}__${upSlug}_road_${idx}.jpg`
         );
-        await downloadWithPage(browser, roadUrl, roadFile);
-      } else {
-        console.warn("    No road JPEG URL for", up.text);
+        await downloadImage(browser, url, dest);
+        idx++;
       }
 
-      // Be kind to the server
       await sleep(1000);
     }
 
-    // Slight pause between districts
     await sleep(2000);
   }
 
