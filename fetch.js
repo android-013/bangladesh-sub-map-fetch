@@ -1,176 +1,212 @@
-// download-upazila-maps.js
-// Scrape all upazila maps & road maps from LGED
-// Root: https://oldweb.lged.gov.bd/UploadedDocument/Map/
+// fetch.js
+// Node 18+ recommended
 
-const axios = require("axios");
-const cheerio = require("cheerio");
 const fs = require("fs");
 const path = require("path");
+const puppeteer = require("puppeteer");
 
-const ROOT_URL = "https://oldweb.lged.gov.bd/UploadedDocument/Map/";
-const OUTPUT_ROOT = path.join(__dirname, "upazila_maps");
+const BASE_URL = "https://oldweb.lged.gov.bd/ViewMap.aspx";
 
-// polite-ish delay between requests (ms)
-const DELAY_MS = 300;
+const OUTPUT_ROOT = path.join(__dirname, "lged_maps");
+const UPAZILA_DIR = path.join(OUTPUT_ROOT, "upazila");
+const ROAD_DIR = path.join(OUTPUT_ROOT, "road");
 
-// helper: sleep
-const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+// --------------------------------------------------
+// Helpers
+// --------------------------------------------------
 
-async function fetchHtml(url) {
-  const res = await axios.get(url, {
-    responseType: "text",
-    timeout: 30000,
-  });
-  return res.data;
+function slugify(str) {
+  return String(str)
+    .toLowerCase()
+    .replace(/['’`]/g, "")           // drop quotes
+    .replace(/[^a-z0-9]+/gi, "_")    // non alnum -> _
+    .replace(/^_+|_+$/g, "");        // trim _
 }
 
-// Normalize any href into a path *relative* to /UploadedDocument/Map/
-function normalizeHref(href) {
-  if (!href) return null;
-
-  // Drop query / hash if any
-  let clean = href.split("#")[0].split("?")[0].trim();
-  if (!clean) return null;
-
-  // If absolute URL, extract pathname
-  if (clean.startsWith("http://") || clean.startsWith("https://")) {
-    try {
-      const u = new URL(clean);
-      clean = u.pathname;
-    } catch {
-      return null;
-    }
+async function ensureDirs() {
+  for (const dir of [OUTPUT_ROOT, UPAZILA_DIR, ROAD_DIR]) {
+    await fs.promises.mkdir(dir, { recursive: true });
   }
-
-  // Remove leading slashes
-  clean = clean.replace(/^\/+/, "");
-
-  // Strip UploadedDocument/Map/ prefix (case insensitive)
-  const prefix = "UploadedDocument/Map/";
-  if (clean.toLowerCase().startsWith(prefix.toLowerCase())) {
-    clean = clean.slice(prefix.length);
-  }
-
-  // Now clean is something like "BARISAL/" or "BARISAL/barisal/file.jpg"
-  return clean;
 }
 
-function parseDirectoryLinks(html) {
-  const $ = cheerio.load(html);
-  const subdirs = [];
-  const files = [];
-
-  $("a").each((_, el) => {
-    const text = $(el).text().trim();
-    let href = $(el).attr("href");
-    if (!href) return;
-
-    // Skip "To Parent Directory"
-    if (/parent directory/i.test(text)) return;
-
-    const rel = normalizeHref(href);
-    if (!rel) return;
-
-    // Ignore if somehow points outside the Map tree
-    if (rel.length === 0) return;
-
-    if (rel.endsWith("/")) {
-      subdirs.push(rel);
-    } else {
-      files.push(rel);
-    }
-  });
-
-  return { subdirs, files };
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function downloadFile(relativePath) {
-  // relativePath is like "DHAKA/dhaka/abhaynagar/abhaynagar_road.jpg"
-  const url = ROOT_URL + relativePath;
-  const localPath = path.join(OUTPUT_ROOT, relativePath);
+async function downloadWithPage(browser, url, destPath) {
+  if (!url) return;
 
-  const segments = relativePath.split("/").filter(Boolean);
-
-  // Only upazila-level files: division/district/upazila/file => 4 segments
-  if (segments.length < 4) {
-    return;
-  }
-
-  // Only map-ish file types
-  if (!/\.(jpe?g|pdf|png)$/i.test(relativePath)) {
-    return;
-  }
-
-  fs.mkdirSync(path.dirname(localPath), { recursive: true });
-
-  if (fs.existsSync(localPath)) {
-    console.log("Exists, skipping:", relativePath);
-    return;
-  }
-
-  console.log("Downloading:", relativePath);
-
-  const res = await axios.get(url, {
-    responseType: "stream",
-    timeout: 600000,
-  });
-
-  await new Promise((resolve, reject) => {
-    const writer = fs.createWriteStream(localPath);
-    res.data.pipe(writer);
-    writer.on("finish", resolve);
-    writer.on("error", reject);
-  });
-
-  await sleep(DELAY_MS);
-}
-
-async function crawl(relativePath = "") {
-  const url = ROOT_URL + relativePath;
-  console.log("Listing:", url);
-
-  let html;
+  const page = await browser.newPage();
   try {
-    html = await fetchHtml(url);
-  } catch (err) {
-    console.error("Failed to fetch listing:", url, err.message);
-    return;
-  }
+    const res = await page.goto(url, {
+      waitUntil: "networkidle2",
+      timeout: 120000
+    });
 
-  const { subdirs, files } = parseDirectoryLinks(html);
-
-  // Download files in this directory
-  for (const fileRel of files) {
-    // If we're inside some folder, join; otherwise use fileRel directly
-    const fullRelPath = relativePath
-      ? path.posix.join(relativePath, fileRel)
-      : fileRel;
-
-    try {
-      await downloadFile(fullRelPath);
-    } catch (err) {
-      console.error("Failed to download:", fullRelPath, err.message);
+    if (!res) {
+      console.warn("No response for", url);
+      await page.close();
+      return;
     }
-  }
 
-  // Recurse into subdirectories
-  for (const dirRel of subdirs) {
-    const nextRelPath = relativePath
-      ? path.posix.join(relativePath, dirRel)
-      : dirRel;
+    const status = res.status();
+    if (status < 200 || status >= 300) {
+      console.warn(`Non-200 for ${url}: ${status}`);
+      await page.close();
+      return;
+    }
 
-    await crawl(nextRelPath);
+    const buffer = await res.buffer();
+    await fs.promises.writeFile(destPath, buffer);
+    console.log("    Saved:", destPath);
+  } catch (err) {
+    console.error("    Download failed for", url, err.message);
+  } finally {
+    await page.close();
   }
 }
+
+// --------------------------------------------------
+// Main
+// --------------------------------------------------
 
 (async () => {
-  try {
-    console.log("Starting LGED upazila map scraper…");
-    console.log("Root:", ROOT_URL);
-    await crawl(""); // start at /UploadedDocument/Map/
-    console.log("Done. Files saved under:", OUTPUT_ROOT);
-  } catch (err) {
-    console.error("Fatal error:", err);
+  await ensureDirs();
+
+  const browser = await puppeteer.launch({
+    headless: true,
+    defaultViewport: { width: 1366, height: 768 }
+  });
+
+  const page = await browser.newPage();
+  await page.goto(BASE_URL, { waitUntil: "networkidle2", timeout: 120000 });
+
+  // Get all districts (value + text), skip "Select (-1)" and value "0"
+  const districts = await page.evaluate(() => {
+    const select = document.querySelector("#ctl00_ContentPlaceHolder1_ddlDistrict");
+    if (!select) return [];
+    return Array.from(select.options)
+      .filter(opt => {
+        const val = (opt.value || "").trim();
+        if (!val) return false;
+        if (val === "0" || val === "-1") return false; // skip 'Select'
+        return true;
+      })
+      .map(opt => ({
+        value: opt.value,
+        text: opt.textContent.trim()
+      }));
+  });
+
+  if (!districts.length) {
+    console.error("No districts found. Check if selectors changed.");
+    await browser.close();
     process.exit(1);
   }
-})();
+
+  console.log(`Found ${districts.length} districts (after filtering dummy ones).`);
+
+  for (const district of districts) {
+    const districtSlug = slugify(district.text);
+    console.log(`\n=== District: ${district.text} (${district.value}) ===`);
+
+    // Select district
+    await page.select("#ctl00_ContentPlaceHolder1_ddlDistrict", district.value);
+
+    // Wait for Upazila dropdown to refresh (ASP.NET postback)
+    await sleep(2000);
+
+    // Get upazila list for this district
+    const upazilas = await page.evaluate(() => {
+      const select = document.querySelector('select[name="ctl00$ContentPlaceHolder1$ddlUpazilla"]');
+      if (!select) return [];
+      return Array.from(select.options)
+        .filter(opt => {
+          const val = (opt.value || "").trim();
+          if (!val) return false;
+          if (val === "0" || val === "-1") return false; // skip 'Select'
+          return true;
+        })
+        .map(opt => ({
+          value: opt.value,
+          text: opt.textContent.trim()
+        }));
+    });
+
+    if (!upazilas.length) {
+      console.warn("  No upazilas found for district:", district.text);
+      continue;
+    }
+
+    console.log(`  Upazilas in ${district.text}: ${upazilas.length}`);
+
+    for (const up of upazilas) {
+      const upSlug = slugify(up.text);
+      console.log(`  -> Upazila: ${up.text} (${up.value})`);
+
+      // Select upazila (triggers __doPostBack on change)
+      await page.select('select[name="ctl00$ContentPlaceHolder1$ddlUpazilla"]', up.value);
+
+      // Give the postback some time
+      await sleep(2500);
+
+      // Read the two JPEG download URLs
+      const urls = await page.evaluate(() => {
+        function safeHref(id) {
+          const a = document.getElementById(id);
+          if (!a) return null;
+          const rawHref = a.getAttribute("href");
+          if (!rawHref) return null;
+          const lower = rawHref.toLowerCase();
+          if (lower.startsWith("javascript")) return null;
+          return rawHref;
+        }
+
+        return {
+          upazilaUrl: safeHref("ctl00_ContentPlaceHolder1_lnkImg"),
+          roadUrl: safeHref("ctl00_ContentPlaceHolder1_lnkImgRoad")
+        };
+      });
+
+      const upazilaUrl = urls.upazilaUrl
+        ? new URL(urls.upazilaUrl, BASE_URL).toString()
+        : null;
+      const roadUrl = urls.roadUrl
+        ? new URL(urls.roadUrl, BASE_URL).toString()
+        : null;
+
+      // Build filenames
+      if (upazilaUrl) {
+        const upFile = path.join(
+          UPAZILA_DIR,
+          `${districtSlug}__${upSlug}_upazila.jpg`
+        );
+        await downloadWithPage(browser, upazilaUrl, upFile);
+      } else {
+        console.warn("    No upazila JPEG URL for", up.text);
+      }
+
+      if (roadUrl) {
+        const roadFile = path.join(
+          ROAD_DIR,
+          `${districtSlug}__${upSlug}_road.jpg`
+        );
+        await downloadWithPage(browser, roadUrl, roadFile);
+      } else {
+        console.warn("    No road JPEG URL for", up.text);
+      }
+
+      // Be kind to the server
+      await sleep(1000);
+    }
+
+    // Slight pause between districts
+    await sleep(2000);
+  }
+
+  await browser.close();
+  console.log("\nDone. Check the 'lged_maps' folder.");
+})().catch(err => {
+  console.error("Fatal error:", err);
+  process.exit(1);
+});
