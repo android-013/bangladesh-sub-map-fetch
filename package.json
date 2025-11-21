@@ -17,5 +17,9 @@
   "bugs": {
     "url": "https://github.com/android-013/bangladesh-sub-map-fetch/issues"
   },
-  "homepage": "https://github.com/android-013/bangladesh-sub-map-fetch#readme"
+  "homepage": "https://github.com/android-013/bangladesh-sub-map-fetch#readme",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "cheerio": "^1.1.2"
+  }
 }
